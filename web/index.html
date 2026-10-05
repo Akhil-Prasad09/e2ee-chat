@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>E2EE Chat Demo</title>
+<meta name="description" content="In-browser simulation of an end-to-end encrypted group chat: X25519, Ed25519, AES-256-GCM, key pinning and safety numbers, with attacks you can run.">
+<style>
+  :root {
+    --bg: #f7f7f5; --surface: #ffffff; --text: #18181b; --muted: #6b6b73; --line: #e4e4e0;
+    --accent: #2563eb; --ok: #15803d; --bad: #b91c1c; --warn: #a16207; --code: #f1f1ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #111113; --surface: #1a1a1d; --text: #ededed; --muted: #a0a0a8; --line: #2a2a2e;
+      --accent: #60a5fa; --ok: #4ade80; --bad: #f87171; --warn: #fbbf24; --code: #222226;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #111113; --surface: #1a1a1d; --text: #ededed; --muted: #a0a0a8; --line: #2a2a2e;
+    --accent: #60a5fa; --ok: #4ade80; --bad: #f87171; --warn: #fbbf24; --code: #222226;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 28px 16px 48px; }
+  h1 { font-size: 1.6rem; margin: 0 0 6px; }
+  .lede { color: var(--muted); margin: 0 0 14px; max-width: 75ch; }
+  .meta { font-size: .85rem; color: var(--muted); margin-bottom: 16px; }
+  a { color: var(--accent); }
+  button { font: inherit; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  .attacks { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
+  .attacks button { border-color: var(--bad); color: var(--bad); }
+  .users { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  @media (max-width: 860px) { .users { grid-template-columns: 1fr; } }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-width: 0; }
+  .panel h2 { font-size: 1.05rem; margin: 0; }
+  .sn { font: 12px/1.4 ui-monospace, Menlo, monospace; color: var(--muted); margin: 2px 0 8px; word-break: break-word; }
+  .log { height: 260px; overflow-y: auto; border-top: 1px solid var(--line); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .msg { padding: 6px 8px; border-radius: 8px; background: var(--code); font-size: .9rem; }
+  .msg .who { font-weight: 600; font-size: .8rem; }
+  .msg.ok .who::after { content: "  verified"; color: var(--ok); font-weight: 500; }
+  .msg.bad { color: var(--bad); }
+  .msg.warn { color: var(--warn); }
+  .msg.info { color: var(--muted); }
+  .msg .to { font-size: .75rem; color: var(--muted); }
+  .compose { display: flex; gap: 6px; margin-top: 8px; }
+  .compose input { flex: 1; min-width: 0; font: inherit; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .offline { color: var(--muted); font-size: .9rem; padding: 20px 0; }
+  .server { margin-top: 12px; }
+  .server pre { margin: 8px 0 0; max-height: 300px; overflow: auto; background: var(--code); border-radius: 8px; padding: 10px; font: 12px/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
+  .server .note { color: var(--muted); font-size: .85rem; margin: 4px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>E2EE Chat demo</h1>
+  <p class="lede">This page runs the protocol of the <a href="https://github.com/Akhil-Prasad09/e2ee-chat">E2EE Chat desktop app</a> entirely in your browser.
+    Each user's keys are generated here, every message is encrypted and signed before it reaches the server, and the server panel below shows
+    everything the relay would store: ciphertext, wrapped keys and signatures, never plaintext. Nothing leaves this page. It is a simulation of the
+    protocol, not the desktop app itself.</p>
+  <p class="meta" id="backend">Generating keys…</p>
+
+  <div class="attacks">
+    <button id="tamper">Tamper with the last message</button>
+    <button id="swap">Server swaps Alice's key</button>
+    <button id="carol">Carol joins late</button>
+    <button id="reset">Reset demo</button>
+  </div>
+
+  <div class="users" id="users"></div>
+
+  <section class="panel server">
+    <h2>Server (relay)</h2>
+    <p class="note" id="serverNote">Stored envelopes: 0. The server can read the routing fields but not the message text.</p>
+    <pre id="serverView" aria-label="Latest envelope stored by the server">Nothing stored yet.</pre>
+  </section>
+</main>
+
+<script type="module">
+// Mirrors e2ee/crypto.py: X25519 + Ed25519 identities, AES-256-GCM message key wrapped per recipient
+// under an ephemeral X25519 key (HKDF-SHA256), Ed25519 signature over the canonical envelope.
+const te = new TextEncoder(), td = new TextDecoder();
+const b64 = (u8) => btoa(String.fromCharCode(...u8));
+const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const cat = (...arrs) => { const out = new Uint8Array(arrs.reduce((n, a) => n + a.length, 0)); let i = 0; for (const a of arrs) { out.set(a, i); i += a.length; } return out; };
+const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+// sort_keys=True, separators=(",", ":"), like canonical() in crypto.py
+const canonical = (o) => te.encode(JSON.stringify(sortKeys(o)));
+function sortKeys(o) {
+  if (Array.isArray(o)) return o.map(sortKeys);
+  if (o && typeof o === "object") return Object.fromEntries(Object.keys(o).sort().map((k) => [k, sortKeys(o[k])]));
+  return o;
+}
+
+// ---------- curve backend: native Web Crypto, else @noble/curves ----------
+let curves;
+async function nativeCurves() {
+  const raw = async (k) => new Uint8Array(await crypto.subtle.exportKey("raw", k));
+  await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);   // throws if unsupported
+  await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"]);
+  return {
+    name: "Web Crypto API (native X25519 and Ed25519)",
+    async genX() { const k = await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"]); return { priv: k.privateKey, pub: await raw(k.publicKey) }; },
+    async genEd() { const k = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]); return { priv: k.privateKey, pub: await raw(k.publicKey) }; },
+    async x25519(priv, pub) {
+      const p = await crypto.subtle.importKey("raw", pub, { name: "X25519" }, true, []);
+      return new Uint8Array(await crypto.subtle.deriveBits({ name: "X25519", public: p }, priv, 256));
+    },
+    async sign(priv, msg) { return new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, priv, msg)); },
+    async verify(pub, sig, msg) {
+      try { const p = await crypto.subtle.importKey("raw", pub, { name: "Ed25519" }, true, ["verify"]); return await crypto.subtle.verify({ name: "Ed25519" }, p, sig, msg); }
+      catch { return false; }
+    },
+  };
+}
+async function nobleCurves() {
+  const { ed25519, x25519 } = await import("https://cdn.jsdelivr.net/npm/@noble/curves@1.9.1/ed25519/+esm");
+  return {
+    name: "@noble/curves (this browser has no native X25519/Ed25519)",
+    async genX() { const priv = x25519.utils.randomPrivateKey(); return { priv, pub: x25519.getPublicKey(priv) }; },
+    async genEd() { const priv = ed25519.utils.randomPrivateKey(); return { priv, pub: ed25519.getPublicKey(priv) }; },
+    async x25519(priv, pub) { return x25519.getSharedSecret(priv, pub); },
+    async sign(priv, msg) { return ed25519.sign(msg, priv); },
+    async verify(pub, sig, msg) { try { return ed25519.verify(sig, msg, pub); } catch { return false; } },
+  };
+}
+
+async function aes(key, op, iv, data, aad) {
+  const k = await crypto.subtle.importKey("raw", key, "AES-GCM", false, [op]);
+  return new Uint8Array(await crypto.subtle[op]({ name: "AES-GCM", iv, additionalData: aad }, k, data));
+}
+async function wrapKey(shared, ephPub, rx, msgId) {
+  const k = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
+  return new Uint8Array(await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: cat(ephPub, rx), info: cat(te.encode("e2ee-chat wrap v1"), msgId) }, k, 256));
+}
+
+// ---------- identities ----------
+async function newIdentity() {
+  const x = await curves.genX(), ed = await curves.genEd();
+  const bundle = { x: b64(x.pub), ed: b64(ed.pub), bind: b64(await curves.sign(ed.priv, cat(te.encode("x25519:"), x.pub))) };
+  return { x, ed, bundle };
+}
+async function verifyBundle(b) {
+  return curves.verify(unb64(b.ed), unb64(b.bind), cat(te.encode("x25519:"), unb64(b.x)));
+}
+async function fingerprint(b) {
+  const d = new Uint8Array(await crypto.subtle.digest("SHA-256", cat(te.encode("e2ee-chat fingerprint v1"), unb64(b.ed), unb64(b.x))));
+  let digits = "";
+  for (let i = 0; i < 30; i += 5) {
+    let n = 0n; for (const byte of d.slice(i, i + 5)) n = (n << 8n) | BigInt(byte);
+    digits += String(n % 100000n).padStart(5, "0");
+  }
+  return digits.match(/.{5}/g).join(" ");
+}
+
+// ---------- seal / open (same checks as open_envelope) ----------
+async function seal(text, sender, id, room, recipients) {
+  const msgId = rand(16), msgKey = rand(32), nonce = rand(12);
+  const header = { v: 1, sender, room, id: b64(msgId), ts: Math.floor(Date.now() / 1000), to: Object.keys(recipients).sort() };
+  const ct = await aes(msgKey, "encrypt", nonce, te.encode(text), canonical(header));
+  const eph = await curves.genX();
+  const keys = {};
+  for (const name of header.to) {
+    const rx = unb64(recipients[name].x);
+    const wk = await wrapKey(await curves.x25519(eph.priv, rx), eph.pub, rx, msgId);
+    const wn = rand(12);
+    keys[name] = { n: b64(wn), k: b64(await aes(wk, "encrypt", wn, msgKey, cat(te.encode(name), msgId))) };
+  }
+  const env = { ...header, eph: b64(eph.pub), nonce: b64(nonce), ct: b64(ct), keys };
+  env.sig = b64(await curves.sign(id.ed.priv, canonical(env)));
+  return env;
+}
+async function openEnvelope(env, me, myId, senderBundle) {
+  const { sig, ...body } = env;
+  if (!(await curves.verify(unb64(senderBundle.ed), unb64(sig), canonical(body)))) throw new Error("bad signature");
+  if (!env.keys[me] || JSON.stringify(Object.keys(env.keys).sort()) !== JSON.stringify(env.to)) throw new Error("not addressed to this user");
+  const msgId = unb64(env.id), ephPub = unb64(env.eph), myX = myId.x.pub;
+  const wk = await wrapKey(await curves.x25519(myId.x.priv, ephPub), ephPub, myX, msgId);
+  const msgKey = await aes(wk, "decrypt", unb64(env.keys[me].n), unb64(env.keys[me].k), cat(te.encode(me), msgId));
+  const header = { v: env.v, sender: env.sender, room: env.room, id: env.id, ts: env.ts, to: env.to };
+  return td.decode(await aes(msgKey, "decrypt", unb64(env.nonce), unb64(env.ct), canonical(header)));
+}
+
+// ---------- simulated world ----------
+const NAMES = ["alice", "bob", "carol"];
+const label = (n) => n[0].toUpperCase() + n.slice(1);
+let server, clients, ui = {};
+
+function buildUI() {
+  const wrap = document.getElementById("users");
+  wrap.innerHTML = "";
+  for (const n of NAMES) {
+    const p = document.createElement("section");
+    p.className = "panel";
+    p.innerHTML = `<h2>${label(n)}</h2><div class="sn"></div><div class="log" aria-live="polite"></div>
+      <form class="compose"><input aria-label="Message from ${label(n)}" placeholder="Message as ${label(n)}" maxlength="500"><button class="primary">Send</button></form>`;
+    wrap.append(p);
+    ui[n] = { sn: p.querySelector(".sn"), log: p.querySelector(".log"), form: p.querySelector("form"), input: p.querySelector("input") };
+    ui[n].form.onsubmit = async (e) => {
+      e.preventDefault();
+      const text = ui[n].input.value.trim();
+      if (!text || !clients[n].online) return;
+      ui[n].input.value = "";
+      await send(n, text);
+    };
+  }
+}
+
+function log(n, cls, who, text, to) {
+  const d = document.createElement("div");
+  d.className = `msg ${cls}`;
+  if (who) { const w = document.createElement("div"); w.className = "who"; w.textContent = who; d.append(w); }
+  const body = document.createElement("div"); body.textContent = text; d.append(body);   // textContent: never render as HTML
+  if (to) { const t = document.createElement("div"); t.className = "to"; t.textContent = `encrypted to: ${to.map(label).join(", ")}`; d.append(t); }
+  ui[n].log.append(d);
+  ui[n].log.scrollTop = ui[n].log.scrollHeight;
+}
+
+async function register(n) {
+  const id = await newIdentity();
+  clients[n] = { id, online: true, pins: {}, trusted: {}, changed: {} };
+  server.directory[n] = id.bundle;
+  ui[n].sn.textContent = `Safety number: ${await fingerprint(id.bundle)}`;
+  ui[n].form.querySelectorAll("input,button").forEach((el) => (el.disabled = false));
+  for (const other of NAMES) if (clients[other]?.online) await learnKeys(other);   // server pushes the directory
+}
+
+async function learnKeys(n) {
+  const c = clients[n];
+  for (const [user, bundle] of Object.entries(server.directory)) {
+    if (user === n || !(await verifyBundle(bundle))) continue;
+    const pinned = c.pins[user];
+    if (!pinned) { c.pins[user] = bundle; c.trusted[user] = bundle; continue; }
+    if ((await fingerprint(pinned)) === (await fingerprint(bundle))) continue;
+    if (!c.changed[user]) {
+      c.changed[user] = bundle; delete c.trusted[user];
+      log(n, "warn", "Safety number changed",
+        `The server now presents a different key for ${label(user)}. Old ${await fingerprint(pinned)}, new ${await fingerprint(bundle)}. ` +
+        `${label(n)} will not encrypt to it or accept messages signed with it until they compare numbers in person.`);
+    }
+  }
+}
+
+async function send(n, text) {
+  const c = clients[n];
+  await learnKeys(n);
+  const recipients = { ...c.trusted, [n]: c.id.bundle };
+  const env = await seal(text, n, c.id, 1, recipients);
+  server.envelopes.push(env);
+  showServer(env);
+  for (const r of NAMES) if (clients[r]?.online) await deliver(r, env);
+}
+
+async function deliver(n, env, history = false) {
+  const c = clients[n];
+  // Verify against the key pinned on first contact, not whatever the server currently claims.
+  const bundle = env.sender === n ? c.id.bundle : c.pins[env.sender];
+  if (!bundle) { log(n, "bad", `From ${label(env.sender)}: rejected`, "Sender's key is unknown."); return; }
+  if (!env.to.includes(n)) { if (!history) log(n, "info", null, `A message from ${label(env.sender)} was not encrypted to ${label(n)}.`); return false; }
+  try {
+    const text = await openEnvelope(env, n, c.id, bundle);
+    log(n, "ok", label(env.sender), text, env.to);
+    return true;
+  } catch (e) {
+    log(n, "bad", `From ${label(env.sender)}: rejected`, `Failed verification (${e.name === "OperationError" ? "decryption failed" : e.message}). Not displayed.`);
+    return true;
+  }
+}
+
+function showServer(env) {
+  document.getElementById("serverNote").textContent =
+    `Stored envelopes: ${server.envelopes.length}. Latest one below, exactly as the server stores it. It can read the routing fields but not the message text.`;
+  const short = (s) => (s.length > 64 ? s.slice(0, 64) + "…" : s);
+  const view = JSON.parse(JSON.stringify(env, (k, v) => (typeof v === "string" && ["ct", "sig", "eph", "k"].includes(k) ? short(v) : v)));
+  document.getElementById("serverView").textContent = JSON.stringify(view, null, 2);
+}
+
+async function reset() {
+  server = { directory: {}, envelopes: [] };
+  clients = {};
+  buildUI();
+  ui.carol.sn.textContent = "Not registered yet.";
+  ui.carol.form.querySelectorAll("input,button").forEach((el) => (el.disabled = true));
+  log("carol", "info", null, "Carol has not joined. Use \"Carol joins late\" after sending a few messages.");
+  document.getElementById("serverView").textContent = "Nothing stored yet.";
+  document.getElementById("serverNote").textContent = "Stored envelopes: 0. The server can read the routing fields but not the message text.";
+  for (const b of ["tamper", "swap", "carol"]) document.getElementById(b).disabled = false;
+  await register("alice");
+  await register("bob");
+}
+
+// ---------- attacks ----------
+document.getElementById("tamper").onclick = async () => {
+  const last = server.envelopes.at(-1);
+  if (!last) { log("alice", "info", null, "Send a message first, then tamper with it."); return; }
+  const bad = structuredClone(last);
+  const ct = unb64(bad.ct); ct[0] ^= 1; bad.ct = b64(ct);                     // flip one ciphertext bit
+  server.envelopes.push(bad);
+  showServer(bad);
+  for (const r of NAMES) if (clients[r]?.online && bad.to.includes(r)) await deliver(r, bad);
+};
+
+document.getElementById("swap").onclick = async () => {
+  const mallory = await newIdentity();                                          // the server's own key pair
+  server.directory.alice = mallory.bundle;                                      // lie about Alice's key
+  await learnKeys("bob");
+  if (clients.carol?.online) await learnKeys("carol");
+  const forged = await seal("Hi Bob, it's Alice. Please send me your password.", "alice", mallory, 1,
+    { bob: clients.bob.id.bundle, ...(clients.carol?.online ? { carol: clients.carol.id.bundle } : {}) });
+  server.envelopes.push(forged);
+  showServer(forged);
+  for (const r of ["bob", "carol"]) if (clients[r]?.online) await deliver(r, forged);
+  document.getElementById("swap").disabled = true;
+};
+
+document.getElementById("carol").onclick = async () => {
+  ui.carol.log.innerHTML = "";
+  await register("carol");
+  let unreadable = 0;
+  for (const env of server.envelopes) if (!env.to.includes("carol")) unreadable++;
+  log("carol", "info", null, `Carol joined. The server holds ${server.envelopes.length} earlier envelopes; ${unreadable} were not encrypted to her, so she cannot read them. New messages will include her.`);
+  document.getElementById("carol").disabled = true;
+};
+
+document.getElementById("reset").onclick = reset;
+
+// ---------- start ----------
+try { curves = await nativeCurves(); } catch { curves = await nobleCurves(); }
+document.getElementById("backend").textContent = `Crypto: ${curves.name}, AES-256-GCM and HKDF-SHA256 from Web Crypto.`;
+await reset();
+window.__demo = { server: () => server, clients: () => clients, send };   // for automated checks
+</script>
+</body>
+</html>

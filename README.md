@@ -1,5 +1,7 @@
 # E2EE Chat
 
+**[Try the live demo](https://akhil-prasad09.github.io/e2ee-chat/)**: an in-browser simulation of the protocol, with attacks you can run (tampering, a server key swap, a late joiner).
+
 An end-to-end encrypted group chat in Python: a PyQt5 desktop client and a multithreaded relay server that stores and forwards messages it cannot read. Each user's keys are generated on their own device and stay there. The server only ever sees public keys and encrypted envelopes.
 
 It grew out of my [internship chat app](https://github.com/Akhil-Prasad09/OIBSP/tree/main/Chat%20Application), which encrypted messages with one key the server held. In this version the server never has a key that can decrypt messages.
@@ -73,4 +75,5 @@ server.py           relay: accounts, public-key directory, envelope storage
 database/           SQLite
 gui/                login and chat windows
 tests/              crypto, protocol and GUI tests
+web/                in-browser demo of the protocol (GitHub Pages)
 ```
