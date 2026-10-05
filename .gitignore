@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+chat_app.db
+.venv/
